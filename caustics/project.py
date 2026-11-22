@@ -57,7 +57,30 @@ def water_normal(uv, t, params):
 
     容差 1e-9。
     """
-    raise NotImplementedError
+    amplitude = params.get("amplitude", 0.0)
+    waves = params.get("waves", [])
+    if not waves or amplitude == 0:
+        return (0.0, 1.0, 0.0)
+
+    u, v = uv
+    dh_du = 0.0
+    dh_dv = 0.0
+    for wave in waves:
+        dx, dy = wave["dir"]
+        freq = wave["freq"]
+        amp = wave["amp"]
+        speed = wave["speed"]
+        phase = wave["phase"]
+
+        angle = 2.0 * math.pi * freq * (dx * u + dy * v) + speed * t + phase
+        # d/dx sin(2*pi*f*(dx*u + dy*v) + ...) = cos(...) * 2*pi*f*dx
+        slope = amplitude * amp * math.cos(angle) * 2.0 * math.pi * freq
+        dh_du += slope * dx
+        dh_dv += slope * dy
+
+    nx, ny, nz = -dh_du, 1.0, -dh_dv
+    length = math.sqrt(nx * nx + ny * ny + nz * nz)
+    return (nx / length, ny / length, nz / length)
 
 
 def refract_dir(incident, normal, eta):
@@ -88,7 +111,18 @@ def refract_dir(incident, normal, eta):
 
     容差 1e-9。
     """
-    raise NotImplementedError
+    c_i = -(incident[0] * normal[0] + incident[1] * normal[1] + incident[2] * normal[2])
+    sin2_t = eta * eta * (1.0 - c_i * c_i)
+    if sin2_t >= 1.0:
+        return None
+
+    c_t = math.sqrt(1.0 - sin2_t)
+    scale = eta * c_i - c_t
+    tx = eta * incident[0] + scale * normal[0]
+    ty = eta * incident[1] + scale * normal[1]
+    tz = eta * incident[2] + scale * normal[2]
+    length = math.sqrt(tx * tx + ty * ty + tz * tz)
+    return (tx / length, ty / length, tz / length)
 
 
 def project_to_floor(origin, dir, floor_y):
@@ -112,7 +146,18 @@ def project_to_floor(origin, dir, floor_y):
 
     容差 1e-9。
     """
-    raise NotImplementedError
+    if dir[1] == 0:
+        return None
+
+    t = (floor_y - origin[1]) / dir[1]
+    if t <= 0:
+        return None
+
+    return (
+        origin[0] + t * dir[0],
+        origin[1] + t * dir[1],
+        origin[2] + t * dir[2],
+    )
 
 
 def caustic_intensity(dir, normal, depth):
@@ -139,7 +184,17 @@ def caustic_intensity(dir, normal, depth):
 
     容差 1e-9。
     """
-    raise NotImplementedError
+    eta = 1.0 / 1.33
+    c_i = -(dir[0] * normal[0] + dir[1] * normal[1] + dir[2] * normal[2])
+    c_i = min(1.0, max(0.0, c_i))
+    sin2_t = eta * eta * (1.0 - c_i * c_i)
+    if sin2_t >= 1.0:
+        return 0.0
+
+    c_t = math.sqrt(1.0 - sin2_t)
+    jacobian = c_i / c_t
+    falloff = 1.0 / ((1.0 + depth) ** 2)
+    return jacobian * falloff
 
 
 def blur_radius(depth, roughness):
@@ -154,7 +209,9 @@ def blur_radius(depth, roughness):
 
     容差 1e-9。
     """
-    raise NotImplementedError
+    if depth < 0 or roughness < 0:
+        raise ValueError("depth and roughness must be non-negative")
+    return roughness * depth
 
 
 def accumulate(uv_hits, size):
@@ -184,7 +241,48 @@ def accumulate(uv_hits, size):
 
     容差 1e-9。
     """
-    raise NotImplementedError
+    if size < 1:
+        raise ValueError("size must be >= 1")
+
+    grid = [[0.0 for _ in range(size)] for _ in range(size)]
+
+    for hit in uv_hits:
+        u, v = hit["uv"]
+        if not (0.0 <= u <= 1.0) or not (0.0 <= v <= 1.0):
+            raise ValueError("uv coordinates must lie in [0, 1]")
+
+        energy = hit["intensity"] * hit["area"]
+
+        col = u * size
+        row = v * size
+        c0 = int(math.floor(col))
+        r0 = int(math.floor(row))
+        # 越界时钳到最后一行/列
+        if c0 > size - 1:
+            c0 = size - 1
+        if r0 > size - 1:
+            r0 = size - 1
+        if c0 < 0:
+            c0 = 0
+        if r0 < 0:
+            r0 = 0
+
+        fx = col - c0
+        fy = row - r0
+        c1 = c0 + 1
+        r1 = r0 + 1
+        if c1 > size - 1:
+            c1 = size - 1
+        if r1 > size - 1:
+            r1 = size - 1
+
+        # 归一化双线性核：四个权重之和恒为 1
+        grid[r0][c0] += energy * (1.0 - fx) * (1.0 - fy)
+        grid[r0][c1] += energy * fx * (1.0 - fy)
+        grid[r1][c0] += energy * (1.0 - fx) * fy
+        grid[r1][c1] += energy * fx * fy
+
+    return grid
 
 
 def validate_params(params):
@@ -202,7 +300,36 @@ def validate_params(params):
 
     缺失的键按非法处理；本函数不抛异常。
     """
-    raise NotImplementedError
+    if not isinstance(params, dict):
+        return ["params must be a dict"]
+
+    errors = []
+
+    def _is_finite_number(value):
+        return (
+            isinstance(value, (int, float))
+            and not isinstance(value, bool)
+            and math.isfinite(value)
+        )
+
+    eta = params.get("eta")
+    if not _is_finite_number(eta) or not (0 < eta <= 3):
+        errors.append("eta must be a finite number in (0, 3]")
+
+    amplitude = params.get("amplitude")
+    if not _is_finite_number(amplitude) or not (0 <= amplitude <= 0.25):
+        errors.append("amplitude must be a finite number in [0, 0.25]")
+
+    depth = params.get("depth")
+    if not _is_finite_number(depth) or not (0 < depth <= 100):
+        errors.append("depth must be a finite number in (0, 100]")
+
+    if "roughness" in params:
+        roughness = params["roughness"]
+        if not _is_finite_number(roughness) or not (0 <= roughness <= 1):
+            errors.append("roughness must be a finite number in [0, 1]")
+
+    return errors
 
 
 def caustics_batch(frames, config):
@@ -230,4 +357,14 @@ def caustics_batch(frames, config):
 
     容差 1e-9。
     """
-    raise NotImplementedError
+    errors = validate_params(config["params"])
+    if errors:
+        raise ValueError(errors)
+
+    size = config["size"]
+    grids = []
+    for frame in frames:
+        # 每帧都新建独立零缓冲，绝不复用上一帧的累积结果。
+        grids.append(accumulate(frame["uv_hits"], size))
+
+    return {"count": len(frames), "frames": grids}
